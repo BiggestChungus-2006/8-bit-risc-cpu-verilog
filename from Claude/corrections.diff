@@ -1,0 +1,976 @@
+--- a/cpu.v
++++ b/cpu.v
+@@ -1,7 +1,13 @@
++// ============================================================================
++// cpu.v - top level: IF stage, IF/ID, branch control; instantiates datapath
++//
++// Changes vs. the audited snapshot (pipeline behaviour is unchanged):
++//   * 'flush' is declared before its first use (was an implicit net)
++//   * the retired external-data path (ext_data, ext_data_reg) is removed
++// ============================================================================
+ module cpu (
+ 
+     input clk,
+-    input [7:0] ext_data,
+ 
+     output reg [3:0] pc,
+     output [11:0] instr,
+@@ -11,13 +17,39 @@
+ );
+ 
+ // ============================================================
+-// IF/ID PIPELINE REGISTER
++// DECLARATIONS (everything is declared before first use)
+ // ============================================================
+ 
++// IF/ID pipeline register
+ reg [11:0] if_id_instr;
+ reg [3:0]  if_id_pc;
+ 
+-reg [7:0] ext_data_reg;
++// ID stage - branch detection
++wire is_branch_id;
++wire signed [3:0] offset;
++wire [3:0] branch_target_id;
++
++// ID/EX pipeline register (control-flow signals only)
++reg       id_ex_is_branch;
++reg [3:0] id_ex_branch_target;
++
++// A taken branch means the instruction currently in IF/ID and the one being
++// latched into datapath.v's ID/EX are both wrong-path. This single signal
++// tells both places to neutralise what they are about to latch.
++wire flush;
++
++
++// ============================================================
++// INITIAL CPU STATE
++// ============================================================
++
++initial begin
++    pc = 4'd0;
++    if_id_instr = 12'b000_000_000_000;
++    if_id_pc    = 4'd0;
++    id_ex_is_branch     = 1'b0;
++    id_ex_branch_target = 4'd0;
++end
+ 
+ 
+ // ============================================================
+@@ -36,7 +68,6 @@
+ 
+ datapath dp (
+         .clk(clk),
+-        .ext_data(ext_data_reg),
+         .instr(if_id_instr),
+         .flush(flush),
+         .zero(zero)
+@@ -44,16 +75,13 @@
+ 
+ 
+ // ============================================================
+-// ID STAGE — BRANCH DETECTION (combinational)
++// ID STAGE - BRANCH DETECTION (combinational)
+ // ============================================================
+ 
+-wire is_branch_id;
+ assign is_branch_id = (if_id_instr[11:9] == 3'b110);
+ 
+-wire signed [3:0] offset;
+ assign offset = {{1{if_id_instr[2]}}, if_id_instr[2:0]};
+ 
+-wire [3:0] branch_target_id;
+ assign branch_target_id = if_id_pc + offset;
+ 
+ 
+@@ -61,9 +89,6 @@
+ // ID/EX PIPELINE REGISTER (control-flow signals only)
+ // ============================================================
+ 
+-reg       id_ex_is_branch;
+-reg [3:0] id_ex_branch_target;
+-
+ always @(posedge clk) begin
+     if (flush) begin
+         id_ex_is_branch     <= 1'b0;
+@@ -76,7 +101,7 @@
+ 
+ 
+ // ============================================================
+-// EX STAGE — BRANCH DECISION (combinational)
++// EX STAGE - BRANCH DECISION (combinational)
+ // ============================================================
+ 
+ assign branch_taken = id_ex_is_branch && zero;
+@@ -86,12 +111,6 @@
+ // FLUSH SIGNAL
+ // ============================================================
+ 
+-// A taken branch means the instruction currently in IF/ID and
+-// the one currently being latched into datapath.v's ID/EX are
+-// both wrong-path. This single signal tells both places to
+-// neutralize what they're about to latch.
+-
+-wire flush;
+ assign flush = branch_taken;
+ 
+ 
+@@ -123,27 +142,4 @@
+     if_id_pc <= pc;
+ end
+ 
+-
+-// ============================================================
+-// EXTERNAL DATA REGISTER
+-// ============================================================
+-
+-always @(negedge clk) begin
+-    ext_data_reg <= ext_data;
+-end
+-
+-
+-// ============================================================
+-// INITIAL CPU STATE
+-// ============================================================
+-
+-initial begin
+-    pc = 4'd0;
+-    if_id_instr = 12'b000_000_000_000;
+-    if_id_pc    = 4'd0;
+-    id_ex_is_branch     = 1'b0;
+-    id_ex_branch_target = 4'd0;
+-    ext_data_reg = 8'd0;
+-end
+-
+-endmodule
+\ No newline at end of file
++endmodule
+--- a/datapath.v
++++ b/datapath.v
+@@ -1,35 +1,112 @@
++// ============================================================================
++// datapath.v - ID / EX / MEM / WB stages of the 5-stage pipeline
++//
++// Changes vs. the audited snapshot (pipeline structure and forwarding are
++// unchanged):
++//   * every net and register is declared before its first use
++//   * all pipeline registers have a defined start-up value (no X at power-up)
++//   * the retired external-data path (ext_data / id_ex_ext_data) is removed
++//
++// LOAD semantics:  R[rd] = DMEM[R[rs1]]   (asynchronous-read data memory)
++// ============================================================================
+ module datapath (
+-    input clk,
+-    input [7:0] ext_data,
+-    input [11:0] instr,
+-    input flush,
+-    output zero
++    input         clk,
++    input  [11:0] instr,     // instruction currently in ID (from IF/ID in cpu.v)
++    input         flush,     // taken-branch flush (from cpu.v)
++    output        zero       // ALU zero flag of the instruction currently in EX
+ );
+ 
+ // ============================================================
+-// 1. ID STAGE — DECODE THE INSTRUCTION
++// 0. DECLARATIONS (everything is declared before first use)
+ // ============================================================
++
++// --- ID stage: decode ---
+ wire [2:0] opcode, rs1, rs2, rd;
++wire [2:0] ra1, ra2, wa;
++wire [2:0] op;
++wire [7:0] rd1, rd2;                 // register-file read data
++wire       we_internal, sel_internal;
++
++// --- WB -> ID forwarding ---
++wire       fwd_id_wb_1, fwd_id_wb_2;
++wire [7:0] rd1_final, rd2_final;
++
++// --- ID/EX pipeline register ---
++reg [7:0] id_ex_rd1, id_ex_rd2;
++reg [2:0] id_ex_op;
++reg [2:0] id_ex_rd;
++reg       id_ex_we;
++reg       id_ex_sel;
++reg [2:0] id_ex_rs1;
++reg [2:0] id_ex_rs2;
++
++// --- EX/MEM pipeline register ---
++reg [7:0] ex_mem_alu_result;
++reg [2:0] ex_mem_rd;
++reg       ex_mem_we;
++reg       ex_mem_sel;
++reg [7:0] ex_mem_addr;               // data-memory address travels with the instruction
++
++// --- MEM/WB pipeline register ---
++reg [7:0] mem_wb_wd;
++reg [2:0] mem_wb_rd;
++reg       mem_wb_we;
++
++// --- MEM stage ---
++wire [7:0] mem_wd;                   // asynchronous data-memory read data
++wire [7:0] mem_out;                  // value handed to MEM/WB
++
++// --- EX stage: forwarding + ALU ---
++wire [7:0] mem_stage_value;
++wire       fwd_ex_mem_a, fwd_mem_wb_a, fwd_ex_mem_b, fwd_mem_wb_b;
++wire [7:0] a_in, b_in;
++wire [7:0] alu_result;
++wire       carry, overflow;
++
++// ============================================================
++// 0b. START-UP STATE
++//     Every pipeline register starts as a harmless bubble (we = 0, rd = 0),
++//     so all forwarding control signals are deterministic from time 0.
++// ============================================================
++initial begin
++    id_ex_rd1         = 8'd0;
++    id_ex_rd2         = 8'd0;
++    id_ex_op          = 3'd0;
++    id_ex_rd          = 3'd0;
++    id_ex_we          = 1'b0;
++    id_ex_sel         = 1'b0;
++    id_ex_rs1         = 3'd0;
++    id_ex_rs2         = 3'd0;
++
++    ex_mem_alu_result = 8'd0;
++    ex_mem_rd         = 3'd0;
++    ex_mem_we         = 1'b0;
++    ex_mem_sel        = 1'b0;
++    ex_mem_addr       = 8'd0;
++
++    mem_wb_wd         = 8'd0;
++    mem_wb_rd         = 3'd0;
++    mem_wb_we         = 1'b0;
++end
+ 
++// ============================================================
++// 1. ID STAGE - DECODE THE INSTRUCTION
++// ============================================================
+ assign opcode = instr[11:9];
+ assign rs1    = instr[8:6];
+ assign rs2    = instr[5:3];
+ assign rd     = instr[2:0];
+ 
+-wire [2:0] ra1, ra2, wa;
+ assign ra1 = rs1;
+ assign ra2 = rs2;
+ assign wa  = rd;
+ 
+-wire [2:0] op;
++// BEQ is executed as a subtraction; its ALU zero flag is the equality result.
+ assign op = (opcode == 3'b110) ? 3'b001 : opcode;
+ 
+ // ============================================================
+-// 2. ID STAGE — CONTROL UNIT + REGISTER FILE READ
++// 2. ID STAGE - CONTROL UNIT
+ // ============================================================
+-wire [7:0] rd1, rd2;
+-wire we_internal, sel_internal;
+-
+ control_unit cu (
+     .opcode(opcode),
+     .we(we_internal),
+@@ -37,106 +114,88 @@
+ );
+ 
+ // ============================================================
+-// 3. ID STAGE — WB → ID FORWARDING
++// 3. ID STAGE - WB -> ID FORWARDING
+ // ============================================================
+-wire fwd_id_wb_1 =
++assign fwd_id_wb_1 =
+     mem_wb_we &&
+     (mem_wb_rd == ra1) &&
+     (ra1 != 3'b000);
+ 
+-wire fwd_id_wb_2 =
++assign fwd_id_wb_2 =
+     mem_wb_we &&
+     (mem_wb_rd == ra2) &&
+     (ra2 != 3'b000);
+ 
+-wire [7:0] rd1_final =
+-    fwd_id_wb_1 ? mem_wb_wd : rd1;
+-
+-wire [7:0] rd2_final =
+-    fwd_id_wb_2 ? mem_wb_wd : rd2;
++assign rd1_final = fwd_id_wb_1 ? mem_wb_wd : rd1;
++assign rd2_final = fwd_id_wb_2 ? mem_wb_wd : rd2;
+ 
+ // ============================================================
+ // 4. ID/EX PIPELINE REGISTER
+ // ============================================================
+-reg [7:0] id_ex_rd1, id_ex_rd2;
+-reg [2:0] id_ex_op;
+-reg [2:0] id_ex_rd;
+-reg       id_ex_we;
+-reg       id_ex_sel;
+-reg [7:0] id_ex_ext_data;
+-reg [2:0] id_ex_rs1;
+-reg [2:0] id_ex_rs2;
+-
+ always @(posedge clk) begin
+     if (flush) begin
+-        id_ex_rd1      <= 8'd0;
+-        id_ex_rd2      <= 8'd0;
+-        id_ex_op       <= 3'd0;
+-        id_ex_rd       <= 3'd0;
+-        id_ex_we       <= 1'b0;
+-        id_ex_sel      <= 1'b0;
+-        id_ex_ext_data <= 8'd0;
+-        id_ex_rs1      <= 3'd0;
+-        id_ex_rs2      <= 3'd0;
++        id_ex_rd1 <= 8'd0;
++        id_ex_rd2 <= 8'd0;
++        id_ex_op  <= 3'd0;
++        id_ex_rd  <= 3'd0;
++        id_ex_we  <= 1'b0;
++        id_ex_sel <= 1'b0;
++        id_ex_rs1 <= 3'd0;
++        id_ex_rs2 <= 3'd0;
+     end else begin
+-        id_ex_rd1      <= rd1_final;
+-        id_ex_rd2      <= rd2_final;
+-        id_ex_op       <= op;
+-        id_ex_rd       <= wa;
+-        id_ex_we       <= we_internal;
+-        id_ex_sel      <= sel_internal;
+-        id_ex_ext_data <= ext_data;
+-        id_ex_rs1      <= rs1;
+-        id_ex_rs2      <= rs2;
++        id_ex_rd1 <= rd1_final;
++        id_ex_rd2 <= rd2_final;
++        id_ex_op  <= op;
++        id_ex_rd  <= wa;
++        id_ex_we  <= we_internal;
++        id_ex_sel <= sel_internal;
++        id_ex_rs1 <= rs1;
++        id_ex_rs2 <= rs2;
+     end
+ end
+ 
+ // ============================================================
+-// 5. EX STAGE — FORWARDING
++// 5. EX STAGE - FORWARDING
++//    Priority: EX/MEM (youngest) > MEM/WB > ID/EX register read.
+ // ============================================================
+-wire [7:0] mem_stage_value;
+ 
+-// FIX TASK 3: Forward the actual output of the MEM stage
+-// Use the combinational memory output for LOADs in the MEM stage.
+-assign mem_stage_value =
+-    ex_mem_sel ? mem_wd : ex_mem_alu_result;
++// Value produced by the instruction currently in MEM: loaded data for a LOAD,
++// otherwise its ALU result.
++assign mem_stage_value = ex_mem_sel ? mem_wd : ex_mem_alu_result;
+ 
+-wire fwd_ex_mem_a =
++assign fwd_ex_mem_a =
+     ex_mem_we &&
+     (ex_mem_rd == id_ex_rs1) &&
+     (id_ex_rs1 != 3'b000);
+ 
+-wire fwd_mem_wb_a =
++assign fwd_mem_wb_a =
+     mem_wb_we &&
+     (mem_wb_rd == id_ex_rs1) &&
+     (id_ex_rs1 != 3'b000);
+ 
+-wire fwd_ex_mem_b =
++assign fwd_ex_mem_b =
+     ex_mem_we &&
+     (ex_mem_rd == id_ex_rs2) &&
+     (id_ex_rs2 != 3'b000);
+ 
+-wire fwd_mem_wb_b =
++assign fwd_mem_wb_b =
+     mem_wb_we &&
+     (mem_wb_rd == id_ex_rs2) &&
+     (id_ex_rs2 != 3'b000);
+ 
+-wire [7:0] a_in =
++assign a_in =
+     fwd_ex_mem_a ? mem_stage_value :
+     fwd_mem_wb_a ? mem_wb_wd :
+                    id_ex_rd1;
+ 
+-wire [7:0] b_in =
++assign b_in =
+     fwd_ex_mem_b ? mem_stage_value :
+     fwd_mem_wb_b ? mem_wb_wd :
+                    id_ex_rd2;
+ 
+ // ============================================================
+-// 6. EX STAGE — ALU
++// 6. EX STAGE - ALU
+ // ============================================================
+-wire [7:0] alu_result;
+-wire carry, overflow;
+-
+ the_alu alu (
+     .a(a_in),
+     .b(b_in),
+@@ -149,51 +208,37 @@
+ 
+ // ============================================================
+ // 7. EX/MEM PIPELINE REGISTER
++//    ex_mem_addr = forwarded rs1 value; for a LOAD this is the memory address.
+ // ============================================================
+-reg [7:0] ex_mem_alu_result;
+-reg [2:0] ex_mem_rd;
+-reg       ex_mem_we;
+-reg       ex_mem_sel;
+-reg [7:0] ex_mem_addr; // FIX TASK 1: Registered address for MEM stage
+-
+ always @(posedge clk) begin
+     ex_mem_alu_result <= alu_result;
+     ex_mem_rd         <= id_ex_rd;
+     ex_mem_we         <= id_ex_we;
+     ex_mem_sel        <= id_ex_sel;
+-    ex_mem_addr       <= a_in; // FIX TASK 1: Address travels with the instruction
++    ex_mem_addr       <= a_in;
+ end
+ 
+ // ============================================================
+-// 8. MEM STAGE
++// 8. MEM STAGE (asynchronous-read data memory)
+ // ============================================================
+-wire [7:0] mem_wd;
+-
+-// FIX TASK 1 & 2: Connect dmem to the registered EX/MEM address
+ dmem dm (
+     .addr(ex_mem_addr),
+     .data(mem_wd)
+ );
+ 
+-// FIX TASK 2: Memory output aligned with current instruction in MEM
+-wire [7:0] mem_out;
+ assign mem_out = ex_mem_sel ? mem_wd : ex_mem_alu_result;
+ 
+ // ============================================================
+ // 9. MEM/WB PIPELINE REGISTER
+ // ============================================================
+-reg [7:0] mem_wb_wd;
+-reg [2:0] mem_wb_rd;
+-reg       mem_wb_we;
+-
+ always @(posedge clk) begin
+-    mem_wb_wd <= mem_out; // Latch the correctly aligned MEM result
++    mem_wb_wd <= mem_out;
+     mem_wb_rd <= ex_mem_rd;
+     mem_wb_we <= ex_mem_we;
+ end
+ 
+ // ============================================================
+-// 10. WB STAGE — REGISTER FILE WRITE
++// 10. WB STAGE - REGISTER FILE WRITE
+ // ============================================================
+ regfile rf (
+     .clk(clk),
+--- a/dmem.v
++++ b/dmem.v
+@@ -1,15 +1,26 @@
++// ============================================================================
++// dmem.v - 256 x 8-bit data memory, asynchronous (combinational) read
++//
++// Every location is initialised to zero, so a LOAD from any address returns a
++// defined value (never X). Two locations carry non-zero preset values.
++// There is no write port (the ISA has no STORE instruction).
++// ============================================================================
+ module dmem (
+-    input [7:0] addr,
++    input  [7:0] addr,
+     output [7:0] data
+ );
+ 
+     reg [7:0] memory [255:0];
+ 
++    integer k;
+     initial begin
+-        // Initialize test locations safely
+-        memory[0] = 8'd10;  // R0 value for first LOAD
+-        memory[10] = 8'd42; // Value for second LOAD: LOAD R2, [R1] where R1=10
+-        // Rest are 0 by default in most simulators, but we can be explicit if needed
++        // 1. Zero all 256 locations.
++        for (k = 0; k < 256; k = k + 1)
++            memory[k] = 8'd0;
++
++        // 2. Preset locations used by the LOAD tests.
++        memory[0]  = 8'd10;   // LOAD R1,[R0]  -> R1 = DMEM[0]  = 10
++        memory[10] = 8'd42;   // LOAD R2,[R1]  -> R2 = DMEM[10] = 42 (when R1 = 10)
+     end
+ 
+     // Combinational read
+--- a/cpu_tb.v
++++ b/cpu_tb.v
+@@ -1,57 +1,381 @@
++// ============================================================================
++// cpu_tb.v - self-checking system-level testbench for the 5-stage CPU
++//
++// HOW IT WORKS
++//   The CPU has no reset input, so every test gets its own CPU instance
++//   (generate loop below). Each instance is loaded with its own program through
++//   a hierarchical write into its instr_mem at t = 1, before the first clock
++//   edge (first rising edge is at t = 5). Test 0 is not overwritten: it runs the
++//   program built into instr_mem.v.
++//
++//   All instances run in lock-step and are checked once, just after rising
++//   edge CHECK_EDGE (= 16). The 4-bit PC wraps 15 -> 0 after 16 fetches, so a
++//   straight-line program would start re-executing from edge 17. Checking at
++//   edge 16 therefore always happens BEFORE any re-executed instruction can
++//   change state. A guard additionally fails the test if the wrapped fetch
++//   was ever observed before the check.
++//
++// WHAT EACH TEST CHECKS (exact, not just "R1 and R2")
++//   1. the final value of every register R1..R7 (unlisted registers must be 0,
++//      so any stray / wrong-path write is caught) and R0 == 0
++//   2. the SET of registers that were ever written back (catches a wrong-path
++//      write even if the value written happens to equal the expected value)
++//   3. the number of cycles in which branch_taken was asserted
++//   4. no X/Z on any forwarding control signal, branch_taken, zero or the
++//      forwarded ALU operands at any time from t = 2 onward
++//
++// Failure => $fatal. Success prints one [PASS] line per test and a final message.
++// Waveforms: cpu.vcd, e.g. scope cpu_tb.t[6].dut.dp for the taken-BEQ test.
++// ============================================================================
+ module cpu_tb;
+ 
+-    reg clk;
+-    reg [7:0] ext_data;
++    localparam NUM_TESTS  = 12;
++    localparam CHECK_EDGE = 16;      // see header: must stay <= 16 (PC wrap)
+ 
+-    wire [3:0] pc;
+-    wire [11:0] instr;
+-    wire zero;
+-    wire branch_taken;
+-
+-    cpu uut (
+-        .clk(clk),
+-        .ext_data(ext_data),
+-        .pc(pc),
+-        .instr(instr),
+-        .zero(zero),
+-        .branch_taken(branch_taken)
+-    );
++    reg     clk      = 1'b0;
++    integer failures = 0;
+ 
+     always #5 clk = ~clk;
+ 
+-    initial begin
+-        $dumpfile("cpu.vcd");
+-        $dumpvars(0, cpu_tb);
++    // ------------------------------------------------------------------
++    // Instruction encoding helpers  [11:9]=op [8:6]=rs1 [5:3]=rs2 [2:0]=rd
++    // ------------------------------------------------------------------
++    localparam [2:0] OP_ADD = 3'b000, OP_BEQ = 3'b110, OP_LOAD = 3'b111;
++    localparam [2:0] R0 = 3'd0, R1 = 3'd1, R2 = 3'd2, R3 = 3'd3,
++                     R4 = 3'd4, R5 = 3'd5, R6 = 3'd6, R7 = 3'd7;
++    localparam [2:0] OFF_P2 = 3'b010,   // +2
++                     OFF_P3 = 3'b011,   // +3
++                     OFF_M2 = 3'b110;   // -2
++    localparam [11:0] NOP = 12'b000_000_000_000;   // ADD R0,R0,R0
++
++    function [11:0] i_add(input [2:0] rd, input [2:0] rs1, input [2:0] rs2);
++        i_add = {OP_ADD, rs1, rs2, rd};
++    endfunction
++
++    function [11:0] i_load(input [2:0] rd, input [2:0] rs1);   // R[rd] = DMEM[R[rs1]]
++        i_load = {OP_LOAD, rs1, 3'b000, rd};
++    endfunction
++
++    function [11:0] i_beq(input [2:0] rs1, input [2:0] rs2, input [2:0] off);
++        i_beq = {OP_BEQ, rs1, rs2, off};
++    endfunction
++
++    // ------------------------------------------------------------------
++    // Test programs (unlisted addresses are NOPs). DMEM[0]=10, DMEM[10]=42.
++    // ------------------------------------------------------------------
++    function [11:0] prog(input integer tid, input integer a);
++        begin
++            prog = NOP;
++            case (tid)
++            // 1: LOAD -> ADD            R1=10, R2=20
++            1: case (a)
++                0: prog = i_load(R1, R0);
++                1: prog = i_add (R2, R1, R1);
++               endcase
++            // 2: ADD -> ADD chain       R1=10 R2=20 R3=30 R4=50
++            //    I2 reads R2 from EX/MEM and R1 from MEM/WB; I3 reads R3 (EX/MEM) and R2 (MEM/WB)
++            2: case (a)
++                0: prog = i_load(R1, R0);
++                1: prog = i_add (R2, R1, R1);
++                2: prog = i_add (R3, R2, R1);
++                3: prog = i_add (R4, R3, R2);
++               endcase
++            // 3: ALU -> LOAD address    R1=10 R2=42 R3=10 R4=10 R5=42
++            3: case (a)
++                0: prog = i_load(R1, R0);
++                1: prog = i_add (R4, R1, R0);   // R4 = 10
++                2: prog = i_load(R5, R4);       // address from the previous ALU result (distance 1)
++                3: prog = i_add (R3, R1, R0);   // R3 = 10
++                4: prog = NOP;
++                5: prog = i_load(R2, R3);       // address from an ALU result 2 instructions earlier
++               endcase
++            // 4: same-destination priority   R1=10 R6=30 R7=30
++            //    I3 sees R6 in both EX/MEM (30, newest) and MEM/WB (20, older): must take 30
++            4: case (a)
++                0: prog = i_load(R1, R0);
++                1: prog = i_add (R6, R1, R1);   // R6 = 20
++                2: prog = i_add (R6, R6, R1);   // R6 = 30
++                3: prog = i_add (R7, R6, R0);   // R7 must be 30
++               endcase
++            // 5: R0 protection          R1=10 R3=10 R4=0 R5=10, R0 stays 0
++            5: case (a)
++                0: prog = i_load(R1, R0);
++                1: prog = i_add (R0, R1, R1);   // attempted write of 20 to R0
++                2: prog = i_add (R3, R0, R1);   // must be 0 + 10
++                3: prog = i_add (R4, R0, R0);   // must be 0
++                4: prog = i_load(R0, R0);       // attempted LOAD into R0 (would be 10)
++                5: prog = i_add (R5, R0, R1);   // must be 0 + 10
++               endcase
++            // 6: taken BEQ, operand from a LOAD (distance 1)    R1=10 R4=20
++            //    target = 1 + 3 = 4; I2 (in ID) and I3 (in IF) are wrong-path
++            6: case (a)
++                0: prog = i_load(R1, R0);
++                1: prog = i_beq (R1, R1, OFF_P3);
++                2: prog = i_add (R2, R1, R1);   // wrong path: R2 must stay 0
++                3: prog = i_load(R3, R0);       // wrong path: R3 must stay 0
++                4: prog = i_add (R4, R1, R1);   // branch target
++               endcase
++            // 7: not-taken BEQ          R1=10 R2=20 R3=20 R4=40, no flush
++            7: case (a)
++                0: prog = i_load(R1, R0);
++                1: prog = i_beq (R1, R0, OFF_P3);   // 10 != 0
++                2: prog = i_add (R2, R1, R1);
++                3: prog = i_add (R3, R1, R1);
++                4: prog = i_add (R4, R2, R3);
++               endcase
++            // 8: backward BEQ           R4=10 R5=20 ; 3 taken branches
++            //    0 -> 3 ; 3 -> 1 (backward, -2) ; 2 -> 5
++            //    The wrong-path BEQ at 3 (after the branch at 2) must be flushed,
++            //    otherwise it would loop back to 1 and R5 would never be written.
++            8: case (a)
++                0: prog = i_beq (R0, R0, OFF_P3);
++                1: prog = i_load(R4, R0);
++                2: prog = i_beq (R0, R0, OFF_P3);
++                3: prog = i_beq (R0, R0, OFF_M2);
++                4: prog = i_add (R6, R4, R4);   // wrong path: R6 must stay 0
++                5: prog = i_add (R5, R4, R4);
++               endcase
++            // 9: wrong-path LOAD in ID + wrong-path ADD in IF; BEQ operand from an ALU result
++            //    R1=10 R5=20 R4=30 ; R2 and R3 must stay 0
++            9: case (a)
++                0: prog = i_load(R1, R0);
++                1: prog = i_add (R5, R1, R1);
++                2: prog = i_beq (R5, R5, OFF_P3);   // target 5
++                3: prog = i_load(R2, R0);           // wrong path (ID)
++                4: prog = i_add (R3, R1, R1);       // wrong path (IF)
++                5: prog = i_add (R4, R5, R1);
++               endcase
++            // 10: start-up: the very first instructions read non-R0 registers
++            10: case (a)
++                0: prog = i_add (R3, R2, R2);
++                1: prog = i_add (R4, R3, R3);
++               endcase
++            // 11: LOAD from an address that was never written   R3 must be 0, not X
++            11: case (a)
++                0: prog = i_load(R1, R0);           // 10
++                1: prog = i_add (R2, R1, R1);       // 20
++                2: prog = i_load(R3, R2);           // DMEM[20] = 0
++                3: prog = i_add (R4, R3, R1);       // 0 + 10
++               endcase
++            endcase
++        end
++    endfunction
++
++    // ------------------------------------------------------------------
++    // Expected results. Register slot r lives at v[8*r +: 8]; R0 is slot 0.
++    // ------------------------------------------------------------------
++    function [63:0] exp_regs(input integer tid);
++        reg [63:0] v;
++        begin
++            v = 64'd0;
++            case (tid)
++            0:  begin v[8*1+:8] = 10; v[8*2+:8] = 42; end
++            1:  begin v[8*1+:8] = 10; v[8*2+:8] = 20; end
++            2:  begin v[8*1+:8] = 10; v[8*2+:8] = 20; v[8*3+:8] = 30; v[8*4+:8] = 50; end
++            3:  begin v[8*1+:8] = 10; v[8*2+:8] = 42; v[8*3+:8] = 10; v[8*4+:8] = 10; v[8*5+:8] = 42; end
++            4:  begin v[8*1+:8] = 10; v[8*6+:8] = 30; v[8*7+:8] = 30; end
++            5:  begin v[8*1+:8] = 10; v[8*3+:8] = 10; v[8*4+:8] = 0;  v[8*5+:8] = 10; end
++            6:  begin v[8*1+:8] = 10; v[8*4+:8] = 20; end
++            7:  begin v[8*1+:8] = 10; v[8*2+:8] = 20; v[8*3+:8] = 20; v[8*4+:8] = 40; end
++            8:  begin v[8*4+:8] = 10; v[8*5+:8] = 20; end
++            9:  begin v[8*1+:8] = 10; v[8*5+:8] = 20; v[8*4+:8] = 30; end
++            10: begin v[8*3+:8] = 0;  v[8*4+:8] = 0;  end
++            11: begin v[8*1+:8] = 10; v[8*2+:8] = 20; v[8*3+:8] = 0;  v[8*4+:8] = 10; end
++            endcase
++            exp_regs = v;
++        end
++    endfunction
+ 
+-        clk = 0;
+-        ext_data = 0;
++    // Set of registers (bit r = Rr) that must be written back at least once.
++    function [7:0] exp_mask(input integer tid);
++        begin
++            case (tid)
++            0:  exp_mask = (8'd1<<1) | (8'd1<<2);
++            1:  exp_mask = (8'd1<<1) | (8'd1<<2);
++            2:  exp_mask = (8'd1<<1) | (8'd1<<2) | (8'd1<<3) | (8'd1<<4);
++            3:  exp_mask = (8'd1<<1) | (8'd1<<2) | (8'd1<<3) | (8'd1<<4) | (8'd1<<5);
++            4:  exp_mask = (8'd1<<1) | (8'd1<<6) | (8'd1<<7);
++            5:  exp_mask = (8'd1<<1) | (8'd1<<3) | (8'd1<<4) | (8'd1<<5);
++            6:  exp_mask = (8'd1<<1) | (8'd1<<4);
++            7:  exp_mask = (8'd1<<1) | (8'd1<<2) | (8'd1<<3) | (8'd1<<4);
++            8:  exp_mask = (8'd1<<4) | (8'd1<<5);
++            9:  exp_mask = (8'd1<<1) | (8'd1<<4) | (8'd1<<5);
++            10: exp_mask = (8'd1<<3) | (8'd1<<4);
++            11: exp_mask = (8'd1<<1) | (8'd1<<2) | (8'd1<<3) | (8'd1<<4);
++            default: exp_mask = 8'd0;
++            endcase
++        end
++    endfunction
++
++    // Number of cycles in which branch_taken must be asserted.
++    function integer exp_bt(input integer tid);
++        begin
++            case (tid)
++            6, 9:    exp_bt = 1;
++            8:       exp_bt = 3;
++            default: exp_bt = 0;
++            endcase
++        end
++    endfunction
+ 
+-        // Run for enough cycles to let both LOADs reach WB
+-        #200; 
++    function [8*48-1:0] test_name(input integer tid);
++        begin
++            case (tid)
++            0:  test_name = "LOAD->LOAD (built-in instr_mem program)";
++            1:  test_name = "LOAD->ADD";
++            2:  test_name = "ADD->ADD chain (EX/MEM + MEM/WB forwarding)";
++            3:  test_name = "ALU->LOAD address (distance 1 and 2)";
++            4:  test_name = "Same-destination forwarding priority";
++            5:  test_name = "R0 protection";
++            6:  test_name = "Taken BEQ + wrong-path flush (LOAD->BEQ)";
++            7:  test_name = "Not-taken BEQ";
++            8:  test_name = "Backward BEQ (+ wrong-path BEQ flushed)";
++            9:  test_name = "Wrong-path LOAD/ADD flushed (ALU->BEQ)";
++            10: test_name = "Start-up: first instrs read non-R0 regs";
++            11: test_name = "LOAD from never-written dmem address = 0";
++            default: test_name = "?";
++            endcase
++        end
++    endfunction
+ 
+-        // TASK 5: Verify expected register values
+-        $display("--- FINAL REGISTER CHECK ---");
+-        $display("R1 = %d (Expected: 10)", uut.dp.rf.regs[1]);
+-        $display("R2 = %d (Expected: 42)", uut.dp.rf.regs[2]);
++    // ------------------------------------------------------------------
++    // One CPU instance + monitors + final check per test
++    // ------------------------------------------------------------------
++    genvar g;
++    generate
++    for (g = 0; g < NUM_TESTS; g = g + 1) begin : t
++
++        wire [3:0]  pc;
++        wire [11:0] instr;
++        wire        zero, branch_taken;
++
++        cpu dut (
++            .clk(clk),
++            .pc(pc),
++            .instr(instr),
++            .zero(zero),
++            .branch_taken(branch_taken)
++        );
+ 
+-        if (uut.dp.rf.regs[1] === 8'd10 && uut.dp.rf.regs[2] === 8'd42) begin
+-            $display("VERIFICATION SUCCESSFUL: R1=10, R2=42");
+-        end else begin
+-            $display("VERIFICATION FAILED!");
+-            $fatal(1, "Register values do not match expected output!");
++        integer    a, r;
++        reg [7:0]  wr_mask;        // registers written back at least once
++        integer    bt_count;       // cycles with branch_taken = 1
++        reg        seen15, wrapped, x_reported, test_ok;
++        reg [63:0] exp_v;
++
++        // ---- load this test's program (test 0 keeps instr_mem.v's own program) ----
++        initial begin
++            if (g != 0) begin
++                #1;
++                for (a = 0; a < 16; a = a + 1)
++                    dut.imem.memory[a] = prog(g, a);
++            end
++        end
++
++        // ---- X / Z monitor (forwarding controls, branch, forwarded operands) ----
++        task check_no_x;
++            begin
++                if (!x_reported &&
++                    ( (^{dut.dp.fwd_id_wb_1, dut.dp.fwd_id_wb_2,
++                         dut.dp.fwd_ex_mem_a, dut.dp.fwd_mem_wb_a,
++                         dut.dp.fwd_ex_mem_b, dut.dp.fwd_mem_wb_b,
++                         branch_taken, zero}) === 1'bx ||
++                      (^{dut.dp.a_in, dut.dp.b_in, dut.dp.mem_stage_value,
++                         dut.dp.mem_wb_wd}) === 1'bx )) begin
++                    x_reported = 1'b1;
++                    failures   = failures + 1;
++                    $display("[FAIL] test %0d (%0s): X/Z on a forwarding or datapath signal at t=%0t",
++                             g, test_name(g), $time);
++                end
++            end
++        endtask
++
++        initial begin
++            wr_mask = 8'd0;  bt_count = 0;
++            seen15 = 1'b0;   wrapped = 1'b0;  x_reported = 1'b0;
++            #2 check_no_x;
++        end
++
++        // t = 0 is skipped: in some Icarus language modes the x->0 initialisation of clk
++        // shows up as a negedge before the DUT initial blocks have run.
++        always @(negedge clk) if ($time != 0) check_no_x;
++
++        // ---- cycle monitor: sampled just BEFORE each edge (= values being committed) ----
++        always @(posedge clk) begin
++            if (dut.dp.mem_wb_we === 1'b1 && dut.dp.mem_wb_rd !== 3'd0)
++                wr_mask[dut.dp.mem_wb_rd] = 1'b1;
++            if (branch_taken === 1'b1)
++                bt_count = bt_count + 1;
++            if (pc === 4'd15)
++                seen15 = 1'b1;
++            else if (pc === 4'd0 && seen15)
++                wrapped = 1'b1;          // PC wrapped: program started to re-execute
++        end
++
++        // ---- final check, just after edge CHECK_EDGE ----
++        initial begin
++            repeat (CHECK_EDGE) @(posedge clk);
++            #1;
++            test_ok = 1'b1;
++            exp_v   = exp_regs(g);
++
++            if (dut.dp.rf.regs[0] !== 8'd0) begin
++                test_ok = 1'b0;
++                $display("  [FAIL] test %0d: R0 = %0d (must always be 0)", g, dut.dp.rf.regs[0]);
++            end
++            for (r = 1; r < 8; r = r + 1)
++                if (dut.dp.rf.regs[r] !== exp_v[8*r +: 8]) begin
++                    test_ok = 1'b0;
++                    $display("  [FAIL] test %0d: R%0d = %0d, expected %0d",
++                             g, r, dut.dp.rf.regs[r], exp_v[8*r +: 8]);
++                end
++            if (wr_mask !== exp_mask(g)) begin
++                test_ok = 1'b0;
++                $display("  [FAIL] test %0d: registers written back = %b, expected %b (bit n = Rn)",
++                         g, wr_mask, exp_mask(g));
++            end
++            if (bt_count !== exp_bt(g)) begin
++                test_ok = 1'b0;
++                $display("  [FAIL] test %0d: branch_taken asserted %0d times, expected %0d",
++                         g, bt_count, exp_bt(g));
++            end
++            if (wrapped) begin
++                test_ok = 1'b0;
++                $display("  [FAIL] test %0d: PC wrapped before the check (program re-execution)", g);
++            end
++            if (x_reported) test_ok = 1'b0;
++
++            if (test_ok)
++                $display("[PASS] test %2d: %0s | R1..R7 = %0d %0d %0d %0d %0d %0d %0d | branch_taken x%0d",
++                         g, test_name(g),
++                         dut.dp.rf.regs[1], dut.dp.rf.regs[2], dut.dp.rf.regs[3],
++                         dut.dp.rf.regs[4], dut.dp.rf.regs[5], dut.dp.rf.regs[6],
++                         dut.dp.rf.regs[7], bt_count);
++            else begin
++                failures = failures + 1;
++                $display("[FAIL] test %2d: %0s", g, test_name(g));
++            end
+         end
+ 
+-        $finish;
+     end
++    endgenerate
+ 
++    // ------------------------------------------------------------------
++    // Top-level: waveform dump and verdict
++    // ------------------------------------------------------------------
+     initial begin
+-        $monitor(
+-            "t=%0t | PC=%d | instr=%b | R1=%d R2=%d",
+-            $time,
+-            pc,
+-            uut.if_id_instr,
+-            uut.dp.rf.regs[1],
+-            uut.dp.rf.regs[2]
+-        );
++        $dumpfile("cpu.vcd");
++        $dumpvars(0, cpu_tb);
++
++        repeat (CHECK_EDGE) @(posedge clk);
++        #5;                                   // all per-test checks ran at +1
++
++        if (failures == 0) begin
++            $display("ALL %0d TESTS PASSED (checked after clock edge %0d, before PC wrap)",
++                     NUM_TESTS, CHECK_EDGE);
++            $finish;
++        end else
++            $fatal(1, "%0d check(s) FAILED - see [FAIL] lines above", failures);
+     end
++
+ endmodule
+--- a/ISA.md
++++ b/ISA.md
+@@ -45,7 +45,36 @@
+         PC = PC + sign_extended_offset
+ 
+ 111 LOAD
+-    Rd = external_data
++    LOAD rd, [rs1]
++    Rd = DMEM[Rs1]
++
++## LOAD
++
++LOAD reads one byte from data memory.
++
++    LOAD rd, [rs1]
++    R[rd] = DMEM[R[rs1]]
++
++- The contents of register `rs1` are used as the 8-bit data-memory address.
++- The byte read from that address is written into `rd`.
++- The `rs2` field (instr[5:3]) is not used by LOAD. It is written as 000 by convention.
++- Writes to R0 are ignored, as for every instruction.
++- LOAD to R0 therefore has no architectural effect.
++- A LOAD may use the result of the immediately preceding instruction as its
++  address (including a preceding LOAD). No software-visible stall or delay slot
++  is required.
++
++The earlier external-data form of LOAD (`Rd = external_data`) is retired. The
++CPU has no external data input.
++
++## Data memory
++
++- 256 locations x 8 bits, byte addressed by an 8-bit address.
++- Read is asynchronous (combinational).
++- There is no STORE instruction. Data memory is read-only from the program's point of view.
++- All locations are initialised to 0, except two preset test locations:
++    - DMEM[0]  = 10
++    - DMEM[10] = 42
+ 
+ ## Branch
+ 
+@@ -67,4 +96,4 @@
+ 
+ BEQ R0,R0,offset
+ 
+-Since R0 is always zero, the condition is always true.
+\ No newline at end of file
++Since R0 is always zero, the condition is always true.
