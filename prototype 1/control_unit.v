@@ -12,7 +12,7 @@ always @(*) begin
             sel = 1;
         end
 
-       3'b101: begin   // ✅ BEQ (NEW BRANCH OPCODE)
+        3'b110: begin   // BEQ — fixed: was 3'b101, doesn't match instr_mem.v encoding
             we  = 0;
             sel = 0;
         end

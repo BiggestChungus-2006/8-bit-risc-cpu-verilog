@@ -12,8 +12,8 @@ module regfile (
 reg [7:0] regs [7:0];
 
 // Read (combinational)
-assign rd1 = regs[ra1];
-assign rd2 = regs[ra2];
+assign rd1 = (ra1 == 3'b000) ? 8'd0 : regs[ra1];
+assign rd2 = (ra2 == 3'b000) ? 8'd0 : regs[ra2];
 
 integer i;
 initial begin
@@ -22,7 +22,7 @@ initial begin
 end
 // Write (sequential)
 always @(posedge clk) begin
-    if (we)
+    if (we && wa != 3'b000)
         regs[wa] <= wd;
 end
 
