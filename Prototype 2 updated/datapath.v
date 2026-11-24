@@ -28,6 +28,7 @@ wire [2:0] ra1, ra2, wa;
 wire [2:0] op;
 wire [7:0] rd1, rd2;                 // register-file read data
 wire       we_internal, sel_internal;
+wire       mem_write_internal;
 
 // --- WB -> ID forwarding ---
 wire       fwd_id_wb_1, fwd_id_wb_2;
@@ -39,6 +40,7 @@ reg [2:0] id_ex_op;
 reg [2:0] id_ex_rd;
 reg       id_ex_we;
 reg       id_ex_sel;
+reg       id_ex_mem_write;
 reg [2:0] id_ex_rs1;
 reg [2:0] id_ex_rs2;
 
@@ -77,6 +79,7 @@ initial begin
     id_ex_rd          = 3'd0;
     id_ex_we          = 1'b0;
     id_ex_sel         = 1'b0;
+    id_ex_mem_write   = 1'b0;
     id_ex_rs1         = 3'd0;
     id_ex_rs2         = 3'd0;
 
@@ -111,8 +114,10 @@ assign op = (opcode == 3'b110) ? 3'b001 : opcode;
 // ============================================================
 control_unit cu (
     .opcode(opcode),
+    .rs2(rs2),
     .we(we_internal),
-    .sel(sel_internal)
+    .sel(sel_internal),
+    .mem_write(mem_write_internal)
 );
 
 // ============================================================
@@ -136,23 +141,25 @@ assign rd2_final = fwd_id_wb_2 ? mem_wb_wd : rd2;
 // ============================================================
 always @(posedge clk) begin
     if (flush) begin
-        id_ex_rd1 <= 8'd0;
-        id_ex_rd2 <= 8'd0;
-        id_ex_op  <= 3'd0;
-        id_ex_rd  <= 3'd0;
-        id_ex_we  <= 1'b0;
-        id_ex_sel <= 1'b0;
-        id_ex_rs1 <= 3'd0;
-        id_ex_rs2 <= 3'd0;
+        id_ex_rd1        <= 8'd0;
+        id_ex_rd2        <= 8'd0;
+        id_ex_op         <= 3'd0;
+        id_ex_rd         <= 3'd0;
+        id_ex_we         <= 1'b0;
+        id_ex_sel        <= 1'b0;
+        id_ex_mem_write  <= 1'b0;
+        id_ex_rs1        <= 3'd0;
+        id_ex_rs2        <= 3'd0;
     end else begin
-        id_ex_rd1 <= rd1_final;
-        id_ex_rd2 <= rd2_final;
-        id_ex_op  <= op;
-        id_ex_rd  <= wa;
-        id_ex_we  <= we_internal;
-        id_ex_sel <= sel_internal;
-        id_ex_rs1 <= rs1;
-        id_ex_rs2 <= rs2;
+        id_ex_rd1        <= rd1_final;
+        id_ex_rd2        <= rd2_final;
+        id_ex_op         <= op;
+        id_ex_rd         <= wa;
+        id_ex_we         <= we_internal;
+        id_ex_sel        <= sel_internal;
+        id_ex_mem_write  <= mem_write_internal;
+        id_ex_rs1        <= rs1;
+        id_ex_rs2        <= rs2;
     end
 end
 
